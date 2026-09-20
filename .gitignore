@@ -1,0 +1,33 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/artifacts/
+cmake-build-*/
+
+# Local validation prefixes
+/_install/
+/_consumer-build/
+/_freshclone/
+
+# IDE / editor state
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Compiler and tooling output
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.log
+*.tmp
+
+# OS noise
+Thumbs.db
+.DS_Store
