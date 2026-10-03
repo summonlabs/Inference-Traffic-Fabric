@@ -218,7 +218,7 @@ UNSUPPORTED accelerator stub instead of the CUDA backend.
 Options: `ITF_BUILD_TOOLS`, `ITF_BUILD_EXAMPLES`, `ITF_BUILD_TESTS`,
 `ITF_STRICT_WARNINGS`, `ITF_ENABLE_ASAN` and `ITF_CUDA=AUTO|ON|OFF`.
 
-Tests never use timeouts; a hanging test is treated as a defect. Every first-party translation unit
+Every first-party translation unit
 is compiled with MSVC `/W4 /WX` (or `-Wall -Wextra -Wpedantic -Werror` elsewhere) and produces
 zero warnings.
 
