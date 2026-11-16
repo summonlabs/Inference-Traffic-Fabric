@@ -183,17 +183,15 @@ void shutdown_sockets() {
 TcpStream::~TcpStream() { close(); }
 
 TcpStream::TcpStream(TcpStream&& other) noexcept
-    : handle_(other.handle_), peer_(std::move(other.peer_)) {
-  other.handle_ = kInvalidHandle;
+    : handle_(other.handle_.exchange(kInvalidHandle)), peer_(std::move(other.peer_)) {
   other.peer_.clear();
 }
 
 TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
   if (this != &other) {
     close();
-    handle_ = other.handle_;
+    handle_.store(other.handle_.exchange(kInvalidHandle));
     peer_ = std::move(other.peer_);
-    other.handle_ = kInvalidHandle;
     other.peer_.clear();
   }
   return *this;
@@ -359,11 +357,23 @@ Status TcpStream::write_all(ByteSpan buffer) {
 }
 
 void TcpStream::close() noexcept {
-  const native_socket handle = to_native(handle_);
-  handle_ = kInvalidHandle;
+  // Exactly one caller takes the handle. A session thread that ends while the
+  // server is stopping closes the same stream from two threads; the second
+  // close must not reach a native handle the first one has already released.
+  const native_socket handle = to_native(handle_.exchange(kInvalidHandle));
   if (!is_valid(handle)) return;
   shutdown_native(handle);
   close_native(handle);
+}
+
+void TcpStream::shutdown_send() noexcept {
+  const native_socket handle = to_native(handle_.load());
+  if (!is_valid(handle)) return;
+#if defined(_WIN32)
+  (void)shutdown(handle, SD_SEND);
+#else
+  (void)shutdown(handle, SHUT_WR);
+#endif
 }
 
 void TcpStream::set_nodelay(bool enabled) noexcept {

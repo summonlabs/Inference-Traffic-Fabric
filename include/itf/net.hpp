@@ -5,6 +5,7 @@
 #ifndef ITF_NET_HPP
 #define ITF_NET_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -38,8 +39,8 @@ class TcpStream {
                                                  std::int64_t connect_timeout_nanos);
   [[nodiscard]] static TcpStream adopt(std::intptr_t handle, std::string peer);
 
-  [[nodiscard]] bool valid() const noexcept { return handle_ != kInvalidHandle; }
-  [[nodiscard]] std::intptr_t native_handle() const noexcept { return handle_; }
+  [[nodiscard]] bool valid() const noexcept { return handle_.load() != kInvalidHandle; }
+  [[nodiscard]] std::intptr_t native_handle() const noexcept { return handle_.load(); }
   [[nodiscard]] const std::string& peer() const noexcept { return peer_; }
 
   Result<std::size_t> read_some(MutableByteSpan buffer, std::int64_t timeout_nanos);
@@ -52,13 +53,21 @@ class TcpStream {
   /// and from another thread while a reader is blocked.
   void close() noexcept;
 
+  /// Closes the sending direction only. The peer reads everything that was
+  /// sent and then an orderly end of stream, while this side can still read
+  /// what the peer sends until the peer closes in turn.
+  void shutdown_send() noexcept;
+
   void set_nodelay(bool enabled) noexcept;
   void set_keepalive(bool enabled) noexcept;
   [[nodiscard]] std::uint16_t local_port() const noexcept;
   [[nodiscard]] std::uint16_t remote_port() const noexcept;
 
  private:
-  std::intptr_t handle_ = kInvalidHandle;
+  /// Atomic so that close() takes the handle exactly once: two threads that
+  /// close the same stream can never both close the native handle, which the
+  /// system may already have handed to another socket.
+  std::atomic<std::intptr_t> handle_{kInvalidHandle};
   std::string peer_;
 };
 

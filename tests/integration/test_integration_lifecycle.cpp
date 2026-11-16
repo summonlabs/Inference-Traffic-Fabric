@@ -365,6 +365,97 @@ ITF_TEST(restart_advances_the_epoch_and_keeps_terminal_history) {
   itf::test::remove_dir(directory);
 }
 
+
+ITF_TEST(the_epoch_a_coordinator_serves_under_is_durable_before_it_serves) {
+  const std::string directory = itf::test::make_temp_dir("integration-durable-epoch");
+  const std::string path = directory + "/coordinator.bin";
+  const auto make_config = [&]() {
+    service::ServiceConfig config;
+    config.server.bind_host = "127.0.0.1";
+    config.server.port = 0;
+    config.server.auth_token = kToken;
+    config.persist = true;
+    config.snapshot_path = path;
+    config.coordinator.boot_seed = 13;
+    return config;
+  };
+
+  // First a boot with no durable state, then a boot over the state the first
+  // one left behind.
+  for (int boot = 0; boot < 2; ++boot) {
+    auto service = std::make_unique<service::CoordinatorService>(make_config(),
+                                                                 &steady_clock_singleton());
+    ITF_REQUIRE_STATUS_OK(service->start());
+    const CoordinatorEpoch serving = service->coordinator().epoch();
+    const BootId incarnation = service->coordinator().incarnation();
+
+    // The coordinator is serving and no message has arrived yet. If the
+    // process died now, this is the document the next boot would read.
+    const auto durable = SnapshotStore(path).load();
+    ITF_CHECK(durable.ok());
+    if (durable.ok()) {
+      ITF_CHECK_EQ(durable.value().epoch.value(), serving.value());
+      Coordinator successor(make_config().coordinator, &steady_clock_singleton());
+      ITF_REQUIRE(successor.boot_from(durable.value()).ok());
+      // The successor must not serve under the epoch or the identity of the
+      // incarnation that died.
+      ITF_CHECK(successor.epoch() > serving);
+      ITF_CHECK(successor.incarnation() != incarnation);
+    }
+    service->stop();
+    service.reset();
+  }
+  itf::test::remove_dir(directory);
+}
+
+
+ITF_TEST(a_refused_document_is_left_as_it_was_found) {
+  const std::string directory = itf::test::make_temp_dir("integration-refused-document");
+  const std::string path = directory + "/coordinator.bin";
+  const auto make_config = [&]() {
+    service::ServiceConfig config;
+    config.server.bind_host = "127.0.0.1";
+    config.server.port = 0;
+    config.server.auth_token = kToken;
+    config.persist = true;
+    config.snapshot_path = path;
+    config.coordinator.boot_seed = 17;
+    return config;
+  };
+
+  {
+    auto service = std::make_unique<service::CoordinatorService>(make_config(),
+                                                                 &steady_clock_singleton());
+    ITF_REQUIRE_STATUS_OK(service->start());
+    net::ClientConfig client_config;
+    client_config.port = service->server().bound_port();
+    client_config.peer_name = "refused-document-client";
+    client_config.auth_token = kToken;
+    auto client = net::Client::connect(client_config);
+    ITF_REQUIRE(client.ok());
+    ITF_REQUIRE(client.value().register_request(itf::test::make_request_id(35, 1), 0).ok());
+    client.value().close();
+    service->stop();
+  }
+  ITF_REQUIRE(itf::test::file_exists(path));
+
+  // The durable document is damaged while the coordinator is down.
+  itf::test::flip_byte(path, SnapshotStore::kHeaderBytes + 4);
+  const std::uint64_t damaged_size = itf::test::file_size(path);
+
+  // The coordinator refuses to start over it, and a coordinator that could not
+  // start leaves it exactly as it was: the second start is refused as well.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    auto service = std::make_unique<service::CoordinatorService>(make_config(),
+                                                                 &steady_clock_singleton());
+    ITF_CHECK(!service->start().ok());
+    service.reset();
+  }
+  ITF_CHECK_EQ(itf::test::file_size(path), damaged_size);
+  ITF_CHECK(!SnapshotStore(path).load().ok());
+  itf::test::remove_dir(directory);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

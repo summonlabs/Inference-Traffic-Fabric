@@ -320,8 +320,8 @@ server.
   no TLS: authentication is a shared secret over the chosen bind address.
 - **One accelerator backend.** CUDA only; other vendors are UNSUPPORTED.
 - **Snapshot, not a log.** Durability is a single atomically replaced file with no compaction and no
-  write-ahead log. Snapshots are written after mutating messages (configurable interval) and on
-  shutdown.
+  write-ahead log. Snapshots are written at boot, after mutating messages (configurable interval)
+  and on shutdown.
 - **Bounded history.** Terminal requests are retained up to `max_retained_terminal_requests`
   (default 2048) and evicted oldest-first; a duplicate completion for an evicted request answers
   `NOT_FOUND`.

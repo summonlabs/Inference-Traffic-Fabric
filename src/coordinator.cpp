@@ -39,6 +39,11 @@ template <class Tag>
   return static_cast<std::uint16_t>(a) >= static_cast<std::uint16_t>(b) ? a : b;
 }
 
+[[nodiscard]] bool is_finished(TransferState value) noexcept {
+  return value == TransferState::Completed || value == TransferState::Refused ||
+         value == TransferState::Abandoned;
+}
+
 }  // namespace
 
 std::string_view to_string(TransferState value) noexcept {
@@ -124,6 +129,7 @@ void Coordinator::clear_state_locked() {
   flows_by_request_.clear();
   flows_by_transfer_.clear();
   transfers_by_request_.clear();
+  finished_transfers_.clear();
   defers_.clear();
   completions_.clear();
   completion_order_.clear();
@@ -302,9 +308,16 @@ Status Coordinator::apply_policy(PolicyConfig policy) {
     return Status(StatusCode::PolicyInvalid, std::string(to_string(verdict)));
   }
   std::lock_guard<std::mutex> guard(mutex_);
+  // The generation is this coordinator's fence, not the document's label: it
+  // always moves past the generation in force, whatever number the incoming
+  // document carries. Taken from the document alone, two different documents
+  // could share a generation, or the generation could move backwards, and a
+  // decision bound to an earlier document would pass under a later one.
+  const PolicyGeneration in_force = policy_.generation();
   policy_ = std::move(policy);
-  policy_.set_generation(policy_.generation().is_unset() ? PolicyGeneration::from(1)
-                                                         : policy_.generation().next());
+  const PolicyGeneration base =
+      policy_.generation() > in_force ? policy_.generation() : in_force;
+  policy_.set_generation(base.is_unset() ? PolicyGeneration::from(1) : base.next());
   return Status::success();
 }
 
@@ -373,6 +386,14 @@ Result<SloContract> Coordinator::register_slo_contract(RequestId request,
   }
   auto existing = slo_contracts_.find(request);
   if (existing == slo_contracts_.end() && slo_contracts_.size() >= config_.limits.max_slo_contracts) {
+    // The ceiling bounds the contracts of requests that are in progress. The
+    // contracts of requests that have finished are released before a new one
+    // is refused: kept, they would fill the registry for good and no later
+    // request could ever be given a contract.
+    release_finished_slo_contracts_locked();
+    existing = slo_contracts_.find(request);
+  }
+  if (existing == slo_contracts_.end() && slo_contracts_.size() >= config_.limits.max_slo_contracts) {
     return Result<SloContract>::failure(StatusCode::CapacityExhausted,
                                         "SLO contract registry is full");
   }
@@ -405,6 +426,13 @@ Result<RouteDecision> Coordinator::issue_route_decision(RequestId request, Attem
   auto existing = route_decisions_.find(attempt);
   if (existing == route_decisions_.end() &&
       route_decisions_.size() >= config_.limits.max_route_decisions) {
+    // As for SLO contracts: only the decisions of requests in progress count
+    // against the ceiling.
+    release_finished_route_decisions_locked();
+    existing = route_decisions_.find(attempt);
+  }
+  if (existing == route_decisions_.end() &&
+      route_decisions_.size() >= config_.limits.max_route_decisions) {
     return Result<RouteDecision>::failure(StatusCode::CapacityExhausted,
                                           "route decision registry is full");
   }
@@ -421,6 +449,28 @@ Result<RouteDecision> Coordinator::issue_route_decision(RequestId request, Attem
   }
   route_decisions_[attempt] = decision;
   return Result<RouteDecision>::success(decision);
+}
+
+void Coordinator::release_finished_slo_contracts_locked() {
+  for (auto entry = slo_contracts_.begin(); entry != slo_contracts_.end();) {
+    const auto record = ledger_.snapshot_request(entry->first);
+    if (!record.has_value() || is_terminal(record->lifecycle)) {
+      entry = slo_contracts_.erase(entry);
+    } else {
+      ++entry;
+    }
+  }
+}
+
+void Coordinator::release_finished_route_decisions_locked() {
+  for (auto entry = route_decisions_.begin(); entry != route_decisions_.end();) {
+    const auto record = ledger_.snapshot_request(entry->second.request);
+    if (!record.has_value() || is_terminal(record->lifecycle)) {
+      entry = route_decisions_.erase(entry);
+    } else {
+      ++entry;
+    }
+  }
 }
 
 Result<ModelGeneration> Coordinator::set_model_generation(
@@ -683,6 +733,13 @@ void Coordinator::clear_defer_locked(const TrafficSubject& subject, TrafficClass
   if (!defer_matches(iterator->second, subject)) return;
   if (iterator->second.starvation_class && streaming_deferrals_ > 0) streaming_deferrals_ -= 1;
   defers_.erase(iterator);
+}
+
+void Coordinator::retire_defer_records_locked(const TrafficSubject& subject) {
+  if (defers_.empty()) return;
+  for (std::size_t index = 0; index < kTrafficClassCount; ++index) {
+    clear_defer_locked(subject, static_cast<TrafficClass>(index));
+  }
 }
 
 bool Coordinator::streaming_pressure_locked() const { return streaming_deferrals_ > 0; }
@@ -1352,6 +1409,22 @@ void Coordinator::release_flow_locked(const FlowRecord& flow) {
 
 void Coordinator::release_request_flows_locked(RequestId request) {
   if (request.is_nil()) return;
+  // Whatever this request was waiting for, it is not waiting any more. A
+  // deferral record left behind would keep reporting a protected flow as
+  // deferred, and bulk traffic yields for as long as one is.
+  if (!defers_.empty()) {
+    const auto record = ledger_.snapshot_request(request);
+    if (record.has_value()) {
+      for (std::uint32_t index = 0;
+           index < record->attempt_count && index < kMaxAttemptsPerRequest; ++index) {
+        TrafficSubject subject;
+        subject.kind = SubjectKind::Serving;
+        subject.request = request;
+        subject.attempt = record->attempts[index].id;
+        retire_defer_records_locked(subject);
+      }
+    }
+  }
   std::vector<FlowId> victims;
   const auto range = flows_by_request_.equal_range(request);
   for (auto entry = range.first; entry != range.second; ++entry) victims.push_back(entry->second);
@@ -1362,12 +1435,8 @@ void Coordinator::release_request_flows_locked(RequestId request) {
     auto transfer = transfers_.find(entry->second);
     if (transfer == transfers_.end()) continue;
     if (!transfer->second.flow.is_nil()) victims.push_back(transfer->second.flow);
-    if (transfer->second.state != TransferState::Completed &&
-        transfer->second.state != TransferState::Refused &&
-        transfer->second.state != TransferState::Abandoned) {
-      transfer->second.state = TransferState::Abandoned;
-      transfer->second.terminal_reason = ReasonCode::RejectedRequestTerminal;
-    }
+    finish_transfer_locked(transfer->second, TransferState::Abandoned,
+                           ReasonCode::RejectedRequestTerminal);
   }
   for (const FlowId& id : victims) {
     const auto found = flows_.find(id);
@@ -1387,6 +1456,40 @@ void Coordinator::release_transfer_flows_locked(StateTransferId transfer) {
     if (found == flows_.end()) continue;
     const FlowRecord copy = found->second;
     release_flow_locked(copy);
+  }
+}
+
+void Coordinator::finish_transfer_locked(TransferRecord& record, TransferState state,
+                                         ReasonCode reason) {
+  // The first terminal state is final: a later refusal or abandonment never
+  // rewrites how a transfer ended.
+  if (is_finished(record.state)) return;
+  record.state = state;
+  record.terminal_reason = reason;
+  finished_transfers_.push_back(record.id);
+  TrafficSubject subject;
+  subject.kind = SubjectKind::Transfer;
+  subject.transfer = record.id;
+  retire_defer_records_locked(subject);
+}
+
+void Coordinator::release_finished_transfers_locked() {
+  while (transfers_.size() >= config_.limits.max_transfer_records &&
+         !finished_transfers_.empty()) {
+    const StateTransferId victim = finished_transfers_.front();
+    finished_transfers_.pop_front();
+    const auto found = transfers_.find(victim);
+    if (found == transfers_.end() || !is_finished(found->second.state)) continue;
+    if (!found->second.request.is_nil()) {
+      const auto range = transfers_by_request_.equal_range(found->second.request);
+      for (auto entry = range.first; entry != range.second; ++entry) {
+        if (entry->second == victim) {
+          transfers_by_request_.erase(entry);
+          break;
+        }
+      }
+    }
+    transfers_.erase(found);
   }
 }
 
@@ -1429,6 +1532,12 @@ Result<StateTransferId> Coordinator::register_transfer(const TransferRegistratio
     return Result<StateTransferId>::failure(StatusCode::AlreadyExists, "transfer already registered");
   }
   if (transfers_.size() >= config_.limits.max_transfer_records) {
+    // The ceiling bounds the transfers that are in progress. Transfers that
+    // have finished are released, oldest first, before a new one is refused:
+    // kept, they would fill the registry for good.
+    release_finished_transfers_locked();
+  }
+  if (transfers_.size() >= config_.limits.max_transfer_records) {
     return Result<StateTransferId>::failure(StatusCode::CapacityExhausted,
                                             "transfer registry is full");
   }
@@ -1436,9 +1545,19 @@ Result<StateTransferId> Coordinator::register_transfer(const TransferRegistratio
   if (!model.ok()) return Result<StateTransferId>::failure(model.status());
   auto state = require_state_generation_locked(registration.state_hash);
   if (!state.ok()) return Result<StateTransferId>::failure(state.status());
-  if (!registration.request.is_nil() && ledger_.is_cancelled(registration.request)) {
-    return Result<StateTransferId>::failure(StatusCode::Cancelled,
-                                            "owner request is cancelled");
+  if (!registration.request.is_nil()) {
+    const auto owner = ledger_.snapshot_request(registration.request);
+    if (owner.has_value() && owner->lifecycle == RequestLifecycle::Cancelled) {
+      return Result<StateTransferId>::failure(StatusCode::Cancelled,
+                                              "owner request is cancelled");
+    }
+    // A request that has completed or failed holds no authority either. Its
+    // transfers were ended with it; one registered afterwards would have
+    // nothing left to end it.
+    if (owner.has_value() && is_terminal(owner->lifecycle)) {
+      return Result<StateTransferId>::failure(StatusCode::Conflict,
+                                              "owner request has already finished");
+    }
   }
   TransferRecord record;
   record.id = registration.id;
@@ -1480,10 +1599,15 @@ Result<TransferAuthorization> Coordinator::authorize_transfer(const TrafficReque
   authorization.pacing = decision.treatment.pacing;
   authorization.priority = decision.treatment.priority;
   if (!authorization.authorized) {
+    if (decision.outcome == DecisionOutcome::Deferred) {
+      // A deferral asks the caller to come back after the hold time; it is
+      // not a refusal. The transfer stays registered so that the retry can
+      // be authorized.
+      return Result<TransferAuthorization>::success(authorization);
+    }
     auto transfer = transfers_.find(subject.transfer);
     if (transfer != transfers_.end()) {
-      transfer->second.state = TransferState::Refused;
-      transfer->second.terminal_reason = decision.reason;
+      finish_transfer_locked(transfer->second, TransferState::Refused, decision.reason);
       release_transfer_flows_locked(subject.transfer);
     }
     transfers_refused_ += 1;
@@ -1495,8 +1619,8 @@ Result<TransferAuthorization> Coordinator::authorize_transfer(const TrafficReque
   }
   auto flow = open_flow_locked(decision, transfer->second.payload_bytes, now);
   if (!flow.ok()) {
-    transfer->second.state = TransferState::Refused;
-    transfer->second.terminal_reason = ReasonCode::RejectedFlowLimit;
+    finish_transfer_locked(transfer->second, TransferState::Refused,
+                           ReasonCode::RejectedFlowLimit);
     transfers_refused_ += 1;
     authorization.authorized = false;
     authorization.reason = ReasonCode::RejectedFlowLimit;
@@ -1538,24 +1662,23 @@ Status Coordinator::complete_transfer(StateTransferId transfer_id, std::uint64_t
   }
   if (record.required_integrity == IntegrityClass::ChecksumAndVerify &&
       verified_bytes != record.payload_bytes) {
-    record.state = TransferState::Refused;
-    record.terminal_reason = ReasonCode::RejectedIntegrityUnavailable;
+    finish_transfer_locked(record, TransferState::Refused,
+                           ReasonCode::RejectedIntegrityUnavailable);
     release_transfer_flows_locked(transfer_id);
     transfers_refused_ += 1;
     return Status(StatusCode::IntegrityMismatch,
                   "verified byte count does not match the authorized payload");
   }
   if (verified_bytes > record.payload_bytes) {
-    record.state = TransferState::Refused;
-    record.terminal_reason = ReasonCode::RejectedIntegrityUnavailable;
+    finish_transfer_locked(record, TransferState::Refused,
+                           ReasonCode::RejectedIntegrityUnavailable);
     release_transfer_flows_locked(transfer_id);
     transfers_refused_ += 1;
     return Status(StatusCode::IntegrityMismatch,
                   "verified byte count exceeds the authorized payload");
   }
   record.verified_bytes = verified_bytes;
-  record.state = TransferState::Completed;
-  record.terminal_reason = ReasonCode::CommittedCompletion;
+  finish_transfer_locked(record, TransferState::Completed, ReasonCode::CommittedCompletion);
   release_transfer_flows_locked(transfer_id);
   transfers_completed_ += 1;
   return Status::success();
@@ -1568,8 +1691,7 @@ Status Coordinator::abandon_transfer(StateTransferId transfer_id, ReasonCode rea
   if (transfer->second.state == TransferState::Completed) {
     return Status(StatusCode::Conflict, "transfer already completed");
   }
-  transfer->second.state = TransferState::Abandoned;
-  transfer->second.terminal_reason = reason;
+  finish_transfer_locked(transfer->second, TransferState::Abandoned, reason);
   release_transfer_flows_locked(transfer_id);
   transfers_refused_ += 1;
   return Status::success();

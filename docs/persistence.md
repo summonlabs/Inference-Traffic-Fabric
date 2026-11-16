@@ -70,8 +70,10 @@ generation fence still applies.
 
 ## Snapshot policy in the service
 
-`CoordinatorService` snapshots after mutating messages, subject to
+`CoordinatorService` snapshots when it boots, after mutating messages, subject to
 `snapshot_interval_nanos` (zero means after every mutating message), and again on shutdown.
-Read-only messages never trigger a write. A snapshot failure is logged and reported; it never
+The boot snapshot makes the new epoch durable before anything is served under it; a coordinator
+that cannot write it does not start. A coordinator that refused its durable document never writes
+over that document. Read-only messages never trigger a write. A snapshot failure is logged and reported; it never
 silently degrades into an in-memory-only mode, and the coordinator reports the last error through
 `last_snapshot_error()`.

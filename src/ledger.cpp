@@ -524,6 +524,25 @@ Result<PublishOutcome> RequestLedger::publish_completion(const CompletionPublica
     accounting_.completions_refused += 1;
     return Result<PublishOutcome>::success(outcome);
   }
+  if (record.requires_revalidation) {
+    // A request interrupted by a coordinator restart has to re-establish
+    // authority first. An attempt from before the restart does not inherit
+    // the right to commit it.
+    outcome.disposition = PublishOutcome::Disposition::Refused;
+    outcome.refusal = StatusCode::RevalidationRequired;
+    outcome.reason = ReasonCode::RejectedRevalidationRequired;
+    accounting_.completions_refused += 1;
+    return Result<PublishOutcome>::success(outcome);
+  }
+  if (!record.is_current_attempt(publication.attempt)) {
+    // Attempt identity is the retry fence: only the attempt the request is
+    // served by can commit or fail it, however the earlier one was displaced.
+    outcome.disposition = PublishOutcome::Disposition::Refused;
+    outcome.refusal = StatusCode::StaleGeneration;
+    outcome.reason = ReasonCode::RejectedStaleAttempt;
+    accounting_.completions_refused += 1;
+    return Result<PublishOutcome>::success(outcome);
+  }
   const std::uint32_t attempt_index = static_cast<std::uint32_t>(found - record.attempts.data());
   AttemptRecord& entry = record.attempts[attempt_index];
   if (entry.lifecycle == AttemptLifecycle::Superseded) {

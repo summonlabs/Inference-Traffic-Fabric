@@ -357,6 +357,83 @@ ITF_TEST(failure_publication_is_recorded_once) {
   ITF_REQUIRE_STATUS_OK(ledger.verify_closure());
 }
 
+
+ITF_TEST(completion_for_an_attempt_that_is_no_longer_current_is_refused) {
+  RequestLedger ledger;
+  (void)ledger.register_request(kRequest, 0);
+  (void)ledger.register_attempt(kRequest, kAttempt, 0, ModelGeneration::from(1),
+                                RouteDecisionGeneration::from(1), 0);
+  (void)ledger.advance_stage(kRequest, kAttempt, ServingStage::Admitted, 1);
+  // The request is retried under a new attempt identity. The first attempt is
+  // no longer the one the request is served by.
+  const auto retry = ledger.register_attempt(kRequest, kSecondAttempt, 0, ModelGeneration::from(1),
+                                             RouteDecisionGeneration::from(1), 2);
+  ITF_REQUIRE(retry.ok());
+  ITF_CHECK_EQ(static_cast<int>(ledger.advance_stage(kRequest, kAttempt, ServingStage::Routing, 3)
+                                    .code()),
+               static_cast<int>(StatusCode::StaleGeneration));
+
+  CompletionPublication publication;
+  publication.request = kRequest;
+  publication.attempt = kAttempt;
+  publication.attempt_generation = AttemptGeneration::from(1);
+  const auto stale = ledger.publish_completion(publication, 4);
+  ITF_REQUIRE(stale.ok());
+  ITF_CHECK(stale.value().refused());
+  ITF_CHECK_EQ(stale.value().reason, ReasonCode::RejectedStaleAttempt);
+  const auto record = ledger.snapshot_request(kRequest);
+  ITF_REQUIRE(record.has_value());
+  ITF_CHECK(!is_terminal(record->lifecycle));
+
+  publication.attempt = kSecondAttempt;
+  publication.attempt_generation = retry.value();
+  const auto current = ledger.publish_completion(publication, 5);
+  ITF_REQUIRE(current.ok());
+  ITF_CHECK(current.value().committed());
+  ITF_REQUIRE_STATUS_OK(ledger.verify_closure());
+}
+
+ITF_TEST(completion_for_a_restored_request_requires_revalidation) {
+  RequestLedger before;
+  (void)before.register_request(kRequest, 0);
+  (void)before.register_attempt(kRequest, kAttempt, 0, ModelGeneration::from(1),
+                                RouteDecisionGeneration::from(1), 0);
+  (void)before.advance_stage(kRequest, kAttempt, ServingStage::Admitted, 1);
+  const auto durable = before.snapshot_request(kRequest);
+  ITF_REQUIRE(durable.has_value());
+
+  // The coordinator restarts: the request comes back interrupted.
+  RequestLedger ledger;
+  ITF_REQUIRE_STATUS_OK(ledger.restore_record(*durable));
+  CompletionPublication publication;
+  publication.request = kRequest;
+  publication.attempt = kAttempt;
+  publication.attempt_generation = AttemptGeneration::from(1);
+  const auto inherited = ledger.publish_completion(publication, 2);
+  ITF_REQUIRE(inherited.ok());
+  ITF_CHECK(inherited.value().refused());
+  ITF_CHECK_EQ(static_cast<int>(inherited.value().refusal),
+               static_cast<int>(StatusCode::RevalidationRequired));
+  const auto interrupted = ledger.snapshot_request(kRequest);
+  ITF_REQUIRE(interrupted.has_value());
+  ITF_CHECK_EQ(static_cast<int>(interrupted->lifecycle),
+               static_cast<int>(RequestLifecycle::Interrupted));
+
+  // Authority is re-established under a new attempt. The attempt from before
+  // the restart stays fenced; the new one commits.
+  const auto revalidated = ledger.revalidate_request(kRequest, kSecondAttempt, 3);
+  ITF_REQUIRE(revalidated.ok());
+  const auto stale = ledger.publish_completion(publication, 4);
+  ITF_REQUIRE(stale.ok());
+  ITF_CHECK(stale.value().refused());
+  publication.attempt = kSecondAttempt;
+  publication.attempt_generation = revalidated.value();
+  const auto committed = ledger.publish_completion(publication, 5);
+  ITF_REQUIRE(committed.ok());
+  ITF_CHECK(committed.value().committed());
+  ITF_REQUIRE_STATUS_OK(ledger.verify_closure());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) { return itf::test::run_all("test_ledger_lifecycle", argc, argv); }

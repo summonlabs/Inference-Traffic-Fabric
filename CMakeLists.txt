@@ -125,6 +125,12 @@ if(NOT ITF_CUDA STREQUAL "OFF")
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    # Build the probe for the device that is present. The toolkit's default
+    # architecture set still contains architectures it has deprecated, and it
+    # warns about every one of them.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+    endif()
     enable_language(CUDA)
     set(ITF_CUDA_ENABLED ON)
   elseif(ITF_CUDA STREQUAL "ON")

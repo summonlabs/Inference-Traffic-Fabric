@@ -71,6 +71,9 @@ class CoordinatorService final : public net::MessageHandler {
   std::unique_ptr<Coordinator> coordinator_;
   std::unique_ptr<net::Server> server_;
   std::atomic<bool> shutdown_requested_{false};
+  /// True between a successful start() and the stop() that ends it. Only a
+  /// coordinator that actually booted has state worth writing on the way out.
+  bool started_ = false;
   std::mutex snapshot_mutex_;
   std::int64_t last_snapshot_nanos_ = 0;
   std::string last_snapshot_error_;

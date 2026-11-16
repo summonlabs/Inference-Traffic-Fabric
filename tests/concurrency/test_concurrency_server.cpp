@@ -3,12 +3,14 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "itf/client.hpp"
+#include "itf/crc32c.hpp"
 #include "service.hpp"
 #include "support/test.hpp"
 #include "support/test_support.hpp"
@@ -210,6 +212,120 @@ ITF_TEST(service_survives_repeated_lifecycle_churn) {
     service.reset();
     itf::test::remove_dir(directory);
   }
+}
+
+
+/// The handshake frame every client sends as soon as it has connected.
+std::vector<std::uint8_t> handshake_frame() {
+  wire::HelloRequest hello;
+  hello.peer_name = "raw-peer";
+  hello.auth_token = kToken;
+  hello.client_boot = BootId(7, 9);
+  Writer writer;
+  hello.encode(writer);
+  std::vector<std::uint8_t> frame(wire::kHeaderBytes, 0);
+  wire::FrameHeader header;
+  header.type = wire::MessageType::HelloRequest;
+  header.payload_length = static_cast<std::uint32_t>(writer.buffer().size());
+  header.sequence = 1;
+  header.payload_crc32c =
+      Crc32c::compute(ByteSpan(writer.buffer().data(), writer.buffer().size()));
+  wire::encode_header(header, MutableByteSpan(frame.data(), frame.size()));
+  frame.insert(frame.end(), writer.buffer().data(), writer.buffer().data() + writer.buffer().size());
+  return frame;
+}
+
+ITF_TEST(a_capacity_refusal_reaches_a_client_that_already_sent_its_handshake) {
+  EchoHandler handler;
+  std::uint16_t port = 0;
+  auto server = make_server(handler, 1, port);
+  ITF_REQUIRE(server != nullptr);
+
+  net::ClientConfig config;
+  config.port = port;
+  config.peer_name = "capacity-holder";
+  config.auth_token = kToken;
+  auto holder = net::Client::connect(config);
+  ITF_REQUIRE(holder.ok());
+  ITF_CHECK(itf::test::wait_until([&] { return server->stats().active_sessions == 1U; }, 5000));
+
+  // A second client connects and, like every client, sends its handshake at
+  // once. Only then does it read what the server had to say.
+  auto stream = net::TcpStream::connect("127.0.0.1", port, 2000000000LL);
+  ITF_REQUIRE(stream.ok());
+  const std::vector<std::uint8_t> hello = handshake_frame();
+  (void)stream.value().write_all(ByteSpan(hello.data(), hello.size()));
+  ITF_CHECK(itf::test::wait_until([&] { return server->stats().rejected_capacity >= 1ULL; }, 5000));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  std::vector<std::uint8_t> header(wire::kHeaderBytes, 0);
+  const Status read = stream.value().read_exact(MutableByteSpan(header.data(), header.size()),
+                                                3000000000LL);
+  ITF_CHECK_STATUS_OK(read);
+  if (read.ok()) {
+    const auto decoded = wire::decode_header(ByteSpan(header.data(), header.size()), 65536);
+    ITF_REQUIRE(decoded.ok());
+    ITF_CHECK_EQ(static_cast<int>(decoded.value().type),
+                 static_cast<int>(wire::MessageType::ErrorResponse));
+    std::vector<std::uint8_t> payload(decoded.value().payload_length, 0);
+    ITF_REQUIRE_STATUS_OK(stream.value().read_exact(
+        MutableByteSpan(payload.data(), payload.size()), 3000000000LL));
+    Reader reader(ByteSpan(payload.data(), payload.size()));
+    const auto error = wire::ErrorResponse::decode(reader);
+    ITF_REQUIRE(error.ok());
+    ITF_CHECK_EQ(static_cast<int>(error.value().code),
+                 static_cast<int>(StatusCode::CapacityExhausted));
+  }
+  stream.value().close();
+  holder.value().close();
+  server->stop();
+}
+
+ITF_TEST(a_silent_session_is_retired_after_the_idle_timeout) {
+  EchoHandler handler;
+  net::ServerConfig server_config;
+  server_config.bind_host = "127.0.0.1";
+  server_config.port = 0;
+  server_config.max_sessions = 1;
+  server_config.auth_token = kToken;
+  server_config.io_timeout_nanos = 50000000;
+  server_config.idle_timeout_nanos = 400000000;
+  net::Server server(server_config, &handler);
+  ITF_REQUIRE_STATUS_OK(server.start());
+  const std::uint16_t port = server.bound_port();
+
+  // A session that keeps talking is never idle, however long it lasts.
+  net::ClientConfig config;
+  config.port = port;
+  config.peer_name = "talkative";
+  config.auth_token = kToken;
+  {
+    auto client = net::Client::connect(config);
+    ITF_REQUIRE(client.ok());
+    int answered = 0;
+    for (int round = 0; round < 8; ++round) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (client.value().heartbeat().ok()) ++answered;
+    }
+    ITF_CHECK_EQ(answered, 8);
+    client.value().close();
+  }
+  ITF_CHECK(itf::test::wait_until([&] { return server.stats().active_sessions == 0U; }, 5000));
+
+  // A peer that connects and then says nothing holds the only session slot.
+  // It has not even proved it knows the secret.
+  auto silent = net::TcpStream::connect("127.0.0.1", port, 2000000000LL);
+  ITF_REQUIRE(silent.ok());
+  ITF_CHECK(itf::test::wait_until([&] { return server.stats().active_sessions == 1U; }, 5000));
+  ITF_CHECK(itf::test::wait_until([&] { return server.stats().active_sessions == 0U; }, 5000));
+
+  // The slot is free again for a client that has something to say.
+  config.peer_name = "after-silence";
+  auto client = net::Client::connect(config);
+  ITF_CHECK(client.ok());
+  if (client.ok()) ITF_CHECK(client.value().heartbeat().ok());
+  silent.value().close();
+  server.stop();
 }
 
 }  // namespace

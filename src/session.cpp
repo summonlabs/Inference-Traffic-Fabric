@@ -4,6 +4,8 @@
 #include "itf/session.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <mutex>
 #include <random>
 #include <string>
@@ -22,10 +24,18 @@ std::mt19937_64& random_source() {
   return engine;
 }
 
+/// One lock for the one engine. A lock declared inside the template below
+/// would be a different lock for every identity type, and two sessions
+/// minting a session id and a peer id at the same moment would then use the
+/// engine concurrently.
+std::mutex& random_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 template <class Tag>
 Id128<Tag> next_random_id() {
-  static std::mutex mutex;
-  std::lock_guard<std::mutex> guard(mutex);
+  std::lock_guard<std::mutex> guard(random_mutex());
   std::uint64_t high = random_source()();
   std::uint64_t low = random_source()();
   if (high == 0 && low == 0) low = 1;
@@ -42,6 +52,36 @@ Id128<Tag> next_random_id() {
         difference | static_cast<unsigned char>(expected[index] ^ provided[index]));
   }
   return difference == 0;
+}
+
+/// Lets the peer take delivery of a final frame before the socket is closed.
+/// Closing a socket that still has unread inbound data, or that receives data
+/// after it was closed, makes the stack answer with a reset, and a reset
+/// discards whatever the peer has not read yet: the very frame that explains
+/// the refusal. A client sends its handshake as soon as it has connected, so
+/// a refusal written at accept time always races with inbound data. The
+/// sending direction is therefore closed first, which hands the peer the
+/// frame followed by an orderly end of stream, and whatever the peer sends is
+/// read and discarded until the peer closes in turn. The wait is bounded in
+/// time and in bytes, so a peer that never closes cannot hold the caller.
+void finish_after_final_frame(TcpStream& stream, const std::atomic<bool>& stopping) {
+  constexpr std::int64_t kSliceNanos = 25000000LL;
+  constexpr std::size_t kMaxDrainBytes = 1U << 20;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  stream.shutdown_send();
+  std::array<std::uint8_t, 4096> scratch{};
+  std::size_t drained = 0;
+  while (drained < kMaxDrainBytes && !stopping.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    const auto received =
+        stream.read_some(MutableByteSpan(scratch.data(), scratch.size()), kSliceNanos);
+    if (!received.ok()) {
+      if (received.code() == StatusCode::NotFound) continue;  // nothing yet: keep waiting
+      break;  // the connection is gone: nothing is left to protect
+    }
+    if (received.value() == 0) break;  // the peer has closed in turn
+    drained += received.value();
+  }
 }
 
 }  // namespace
@@ -201,6 +241,9 @@ void Server::accept_loop() {
       wire::encode_header(refusal, MutableByteSpan(header.data(), header.size()));
       (void)slot->stream->write_all(ByteSpan(header.data(), header.size()));
       (void)slot->stream->write_all(ByteSpan(writer.buffer().data(), writer.size()));
+      // The refused client has usually sent its handshake already, so the
+      // connection is not closed under it.
+      finish_after_final_frame(*slot->stream, stopping_);
       slot->stream->close();
       continue;
     }
@@ -229,6 +272,13 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
   std::uint64_t outbound_sequence = 0;
   std::uint64_t replays = 0;
   bool handshaken = false;
+  // Set when the session ends because this side refused it: the peer is then
+  // given the chance to read the refusal before the socket is closed.
+  bool refused = false;
+  // Idleness is measured from the moment this side went back to waiting, so
+  // the time a frame took to handle is never counted against the peer.
+  bool frame_handled = false;
+  auto waiting_since = std::chrono::steady_clock::now();
   auto bump = [&](std::uint64_t SessionStats::*field, std::uint64_t amount) {
     std::lock_guard<std::mutex> guard(stats_mutex_);
     stats_.*field += amount;
@@ -267,18 +317,35 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
 
   for (;;) {
     if (stopping_.load()) break;
+    if (frame_handled) {
+      frame_handled = false;
+      waiting_since = std::chrono::steady_clock::now();
+    }
     std::vector<std::uint8_t> header(wire::kHeaderBytes, 0);
     const Status read_header =
         stream.read_exact(MutableByteSpan(header.data(), header.size()), config_.io_timeout_nanos);
     if (!read_header.ok()) {
-      if (read_header.code() == StatusCode::NotFound) continue;
+      if (read_header.code() == StatusCode::NotFound) {
+        // No frame arrived within the wait. A peer that stays silent for the
+        // idle timeout gives its slot back: otherwise connections that went
+        // quiet, or that never sent a handshake at all, would hold the
+        // bounded session table until the server was restarted.
+        if (config_.idle_timeout_nanos > 0 &&
+            std::chrono::steady_clock::now() - waiting_since >=
+                std::chrono::nanoseconds(config_.idle_timeout_nanos)) {
+          break;
+        }
+        continue;
+      }
       break;
     }
+    frame_handled = true;
     const auto decoded = wire::decode_header(ByteSpan(header.data(), header.size()), max_payload);
     if (!decoded.ok()) {
       bump(&SessionStats::frames_invalid, 1);
       bump(&SessionStats::bytes_in, header.size());
       send_error(decoded.code(), wire::MessageType::Invalid, decoded.status().message(), 0);
+      refused = true;
       break;
     }
     const wire::FrameHeader frame = decoded.value();
@@ -297,6 +364,7 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
       bump(&SessionStats::frames_invalid, 1);
       send_error(StatusCode::IntegrityMismatch, frame.type, "frame payload checksum mismatch",
                  frame.sequence);
+      refused = true;
       break;
     }
     if (frame.sequence <= inbound_sequence) {
@@ -304,7 +372,10 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
       bump(&SessionStats::replays_rejected, 1);
       send_error(StatusCode::ReplayRejected, frame.type,
                  "frame sequence is not greater than the last accepted sequence", frame.sequence);
-      if (replays > 8) break;
+      if (replays > 8) {
+        refused = true;
+        break;
+      }
       continue;
     }
     inbound_sequence = frame.sequence;
@@ -315,6 +386,7 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
         bump(&SessionStats::rejected_protocol, 1);
         send_error(StatusCode::NotAuthorized, frame.type, "session handshake is required",
                    frame.sequence);
+        refused = true;
         break;
       }
       Reader reader(body);
@@ -323,6 +395,7 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
         bump(&SessionStats::rejected_protocol, 1);
         send_error(hello.ok() ? StatusCode::TrailingGarbage : hello.status().code(),
                    frame.type, "handshake body is not acceptable", frame.sequence);
+        refused = true;
         break;
       }
       if (config_.require_auth &&
@@ -330,6 +403,7 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
         bump(&SessionStats::rejected_auth, 1);
         send_error(StatusCode::NotAuthorized, frame.type, "session secret was not accepted",
                    frame.sequence);
+        refused = true;
         break;
       }
       max_payload = std::min<std::uint32_t>(
@@ -381,6 +455,7 @@ void Server::serve_session(std::shared_ptr<SessionSlot> slot) {
   }
 
   if (handshaken && handler_ != nullptr) handler_->on_session_closed(context);
+  if (refused) finish_after_final_frame(stream, stopping_);
   stream.close();
   active_sessions_.fetch_sub(1);
   slot->finished.store(true);

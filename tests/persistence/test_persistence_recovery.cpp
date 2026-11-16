@@ -179,6 +179,55 @@ ITF_TEST(a_refused_document_never_partially_applies) {
                static_cast<int>(StatusCode::NotFound));
 }
 
+
+ITF_TEST(an_attempt_from_before_the_restart_cannot_commit_an_interrupted_request) {
+  Snapshot snapshot;
+  VirtualClock clock;
+  const RequestId request = itf::test::make_request_id(92, 1);
+  const AttemptId attempt = itf::test::make_attempt_id(92, 1);
+
+  Coordinator coordinator(snapshot.config, &clock);
+  ITF_REQUIRE(coordinator.boot_fresh().ok());
+  ITF_REQUIRE(coordinator.set_model_generation(kModelHash, std::nullopt).ok());
+  ITF_REQUIRE(coordinator.register_request(request).ok());
+  const auto registration = coordinator.register_attempt(request, attempt, kModelHash);
+  ITF_REQUIRE(registration.ok());
+  const auto state = coordinator.export_state();
+  ITF_REQUIRE(state.ok());
+
+  Coordinator restored(snapshot.config, &clock);
+  ITF_REQUIRE(restored.boot_from(state.value()).ok());
+
+  // A worker that outlived the coordinator publishes the completion of the
+  // attempt it was given before the restart.
+  CompletionPublication publication;
+  publication.request = request;
+  publication.attempt = attempt;
+  publication.attempt_generation = registration.value();
+  const auto inherited = restored.publish_completion(publication);
+  ITF_REQUIRE(inherited.ok());
+  ITF_CHECK(inherited.value().refused());
+  const auto record = restored.request_record(request);
+  ITF_REQUIRE(record.has_value());
+  ITF_CHECK_EQ(static_cast<int>(record->lifecycle),
+               static_cast<int>(RequestLifecycle::Interrupted));
+  ITF_CHECK(record->requires_revalidation);
+
+  // Fresh authority is a new attempt; only that attempt can commit.
+  const AttemptId fresh = itf::test::make_attempt_id(92, 2);
+  const auto revalidated = restored.revalidate_request(request, fresh);
+  ITF_REQUIRE(revalidated.ok());
+  const auto stale = restored.publish_completion(publication);
+  ITF_REQUIRE(stale.ok());
+  ITF_CHECK(stale.value().refused());
+  publication.attempt = fresh;
+  publication.attempt_generation = revalidated.value();
+  const auto committed = restored.publish_completion(publication);
+  ITF_REQUIRE(committed.ok());
+  ITF_CHECK(committed.value().committed());
+  ITF_REQUIRE_STATUS_OK(restored.verify_invariants());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

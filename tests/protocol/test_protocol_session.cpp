@@ -2,8 +2,10 @@
 // Licensed under the Apache License, Version 2.0.
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "itf/client.hpp"
@@ -362,6 +364,62 @@ ITF_TEST(truncated_frames_do_not_wedge_the_server) {
   auto client = net::Client::connect(client_config);
   ITF_REQUIRE(client.ok());
   ITF_CHECK(client.value().heartbeat().ok());
+  server->stop();
+}
+
+
+ITF_TEST(an_oversized_frame_is_answered_even_when_its_payload_follows) {
+  AckHandler handler;
+  net::ServerConfig config;
+  std::uint16_t port = 0;
+  auto server = start_server(handler, config, port);
+  ITF_REQUIRE(server != nullptr);
+
+  auto stream = net::TcpStream::connect("127.0.0.1", port, 2000000000LL);
+  ITF_REQUIRE(stream.ok());
+  RawSession session;
+  session.stream = std::move(stream).value();
+  wire::HelloRequest hello;
+  hello.peer_name = "greedy-peer";
+  hello.auth_token = kToken;
+  hello.client_boot = BootId(5, 6);
+  hello.max_frame_payload = 4096;
+  Writer writer;
+  hello.encode(writer);
+  ITF_REQUIRE(session.send(wire::MessageType::HelloRequest,
+                           ByteSpan(writer.buffer().data(), writer.buffer().size()))
+                  .ok());
+  wire::MessageType type = wire::MessageType::Invalid;
+  ITF_REQUIRE(session.receive(type).ok());
+  ITF_CHECK_EQ(static_cast<int>(type), static_cast<int>(wire::MessageType::HelloResponse));
+
+  // A peer that ignores the negotiated limit sends the whole frame, header
+  // and payload, before it reads anything.
+  const std::vector<std::uint8_t> oversized(8192, 0x41);
+  std::vector<std::uint8_t> header(wire::kHeaderBytes, 0);
+  wire::FrameHeader frame;
+  frame.type = wire::MessageType::Heartbeat;
+  frame.payload_length = static_cast<std::uint32_t>(oversized.size());
+  frame.sequence = 2;
+  frame.payload_crc32c = Crc32c::compute(ByteSpan(oversized.data(), oversized.size()));
+  wire::encode_header(frame, MutableByteSpan(header.data(), header.size()));
+  ITF_REQUIRE_STATUS_OK(session.stream.write_all(ByteSpan(header.data(), header.size())));
+  (void)session.stream.write_all(ByteSpan(oversized.data(), oversized.size()));
+  ITF_CHECK(itf::test::wait_until([&] { return server->stats().frames_invalid >= 1ULL; }, 5000));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // The refusal is the answer to that frame: it has to be readable.
+  const auto response = session.receive(type);
+  ITF_CHECK(response.ok());
+  if (response.ok()) {
+    ITF_CHECK_EQ(static_cast<int>(type), static_cast<int>(wire::MessageType::ErrorResponse));
+    Reader reader(ByteSpan(response.value().data(), response.value().size()));
+    const auto error = wire::ErrorResponse::decode(reader);
+    ITF_REQUIRE(error.ok());
+    ITF_CHECK_EQ(static_cast<int>(error.value().code),
+                 static_cast<int>(StatusCode::BoundsExceeded));
+  }
+  session.stream.close();
   server->stop();
 }
 

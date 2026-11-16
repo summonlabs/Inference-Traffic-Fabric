@@ -263,6 +263,12 @@ class Coordinator {
   void clear_defer_locked(const TrafficSubject& subject, TrafficClass traffic);
   void release_request_flows_locked(RequestId request);
   void release_transfer_flows_locked(StateTransferId transfer);
+  /// Moves a transfer to a terminal state. The first terminal state is final.
+  void finish_transfer_locked(TransferRecord& record, TransferState state, ReasonCode reason);
+  void release_finished_transfers_locked();
+  void release_finished_slo_contracts_locked();
+  void release_finished_route_decisions_locked();
+  void retire_defer_records_locked(const TrafficSubject& subject);
   void release_flow_locked(const FlowRecord& flow);
   void evict_defer_records_locked();
   [[nodiscard]] std::uint64_t defer_key(const TrafficSubject& subject,
@@ -292,6 +298,9 @@ class Coordinator {
   std::unordered_multimap<RequestId, FlowId> flows_by_request_;
   std::unordered_multimap<StateTransferId, FlowId> flows_by_transfer_;
   std::unordered_multimap<RequestId, StateTransferId> transfers_by_request_;
+  /// Transfers that have reached a terminal state, oldest first. They are the
+  /// records the registry gives up when it is full.
+  std::deque<StateTransferId> finished_transfers_;
   std::unordered_map<std::uint64_t, DeferRecord> defers_;
   std::unordered_map<RequestId, PublishOutcome> completions_;
   std::deque<RequestId> completion_order_;

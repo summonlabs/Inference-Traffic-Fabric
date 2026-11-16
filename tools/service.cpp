@@ -74,12 +74,32 @@ Status CoordinatorService::start() {
     const Status booted = coordinator_->boot_fresh().status();
     if (!booted.ok()) return booted;
   }
-  return server_->start();
+  if (config_.persist && !config_.snapshot_path.empty()) {
+    // The epoch, the boot count and the incarnation this boot runs under are
+    // made durable before anything is served under them. A process that died
+    // before its first snapshot would otherwise leave the next boot to read
+    // the previous document and come up under the same epoch - and, with a
+    // configured boot seed, the same incarnation - so that whatever the dead
+    // incarnation had issued would pass as current.
+    const Status saved = save_snapshot();
+    if (!saved.ok()) {
+      return Status(saved.code(),
+                    std::string("the boot could not be made durable: ") + saved.to_string());
+    }
+  }
+  const Status serving = server_->start();
+  if (serving.ok()) started_ = true;
+  return serving;
 }
 
 void CoordinatorService::stop() {
   if (server_) server_->stop();
-  if (config_.persist && !config_.snapshot_path.empty()) {
+  // A coordinator that never booted has nothing to save. Writing its empty
+  // state would overwrite the very document start() refused, and with it
+  // whatever could still have been recovered from that document.
+  const bool was_started = started_;
+  started_ = false;
+  if (was_started && config_.persist && !config_.snapshot_path.empty()) {
     const Status saved = save_snapshot();
     if (!saved.ok()) {
       log_warn("service", std::string("final snapshot failed: ") + saved.to_string());
